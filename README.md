@@ -1,8 +1,8 @@
 <div align="center">
 
-# 🧠 Memory
+# 🧠 ANY HARNESS MEMORY
 
-### A self-contained, production-grade **semantic memory system** for AI agents
+### A self-contained, production-grade **semantic memory system** for **any harness**
 
 **PostgreSQL · Qdrant · Redis · MCP** — bi‑temporal, hybrid, durable, harness‑agnostic.
 
@@ -133,6 +133,39 @@ memory_timeline { "memory_id": "..." }
 
 ---
 
+## 🧬 Auto-Learning — no model training
+
+**The model is never retrained.** Learning lives in the *memory substrate*: the system
+captures outcomes, keeps what works, discards what doesn't, and injects the result as
+context into every future turn — so the agent behaves better without touching the weights.
+
+```mermaid
+flowchart LR
+  O["✅ / ❌ outcome"] --> T["trajectory_close · task_end"]
+  T --> P{"repeated success?"}
+  P -- "yes" --> PR["promote → procedure memory"]
+  T --> DM["dream / reflect →<br/>success vs failure insights"]
+  PR --> X["context injection<br/>memory://context · recall"]
+  DM --> X
+  NC["noise / stale"] --> DC["decay + consolidate (forget)"]
+  DC --> X
+  X --> B["🧠 better behavior next time"]
+```
+
+| Mechanism | What it learns |
+|---|---|
+| Outcome capture (`task_end`, `trajectory_close`) | which approaches succeed vs fail |
+| **Promotion** | repeated wins become **procedure** memories |
+| **Dream / reflection** | comparative insight from mixed trajectories |
+| **Feedback loop** (`memory_feedback`) | re-ranks useful vs irrelevant memories |
+| **Decay + consolidation** | forgets noise, keeps signal |
+| **Self-editing core** (`memory_hint`, `core_update`) | the agent directs its own memory |
+
+> Net effect: **continuous, non-parametric learning** — no fine-tuning, no retraining,
+> no GPU. The "learner" is the evolving, curated memory that is injected into the prompt.
+
+---
+
 ## 🚀 Install
 
 ### Prerequisites
@@ -145,7 +178,7 @@ memory_timeline { "memory_id": "..." }
 
 ```bash
 # 1) get the code
-git clone https://github.com/Akshat-530/memory.git
+git clone https://github.com/Akshat-530/any-harness-memory.git
 cd memory
 
 # 2) configure
@@ -324,6 +357,6 @@ memory/
 
 **Built to remember. Designed not to forget what mattered.**
 
-⭐ Star the repo if Memory powers your agents.
+⭐ Star the repo if ANY HARNESS MEMORY powers your agents.
 
 </div>
