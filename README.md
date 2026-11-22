@@ -2,7 +2,7 @@
 
 # 🧠 ANY HARNESS MEMORY
 
-### A self-contained, production-grade **semantic memory system** for **any harness**
+### A self-contained, production-grade **memory + RAG** system for **any harness**
 
 **PostgreSQL · Qdrant · Redis · MCP** — bi‑temporal, hybrid, durable, harness‑agnostic.
 
@@ -11,6 +11,9 @@
 ![docker](https://img.shields.io/badge/docker-compose-2496ED?style=for-the-badge&logo=docker&logoColor=white)
 ![python](https://img.shields.io/badge/python-3.12-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![mcp](https://img.shields.io/badge/MCP-ready-8A2BE2?style=for-the-badge)
+![rag](https://img.shields.io/badge/RAG-knowledge%20base-ff6f00?style=for-the-badge)
+
+> 🧠 Long-term memory · 📚 Document knowledge base (RAG) · 🕰️ Bi-temporal · 🧬 Auto-learning · 🔌 MCP-native
 
 </div>
 
@@ -18,8 +21,8 @@
 
 ## ✨ What is Memory?
 
-**Memory** is a complete memory backend you run yourself. One `docker compose up` gives
-an AI agent a real long‑term memory: it **remembers**, **recalls**, **relates**,
+**Memory** is a complete **memory + RAG** backend you run yourself. One `docker compose up`
+gives an AI agent both a real long‑term memory **and a searchable knowledge base (RAG) over your documents** — in one stack: it **remembers**, **recalls**, **relates**,
 **forgets what changed**, and **learns from outcomes** — across sessions, machines and
 harnesses.
 
