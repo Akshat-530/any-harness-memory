@@ -32,8 +32,8 @@ harnesses.
 | 🧩 Piece | 🗄️ Role | 💾 Persistence |
 |---|---|---|
 | **memory-mcp** | FastMCP server · dashboard · metrics | stateless (code in image) |
-| **PostgreSQL 17** | Canonical **source of truth** + transactional outbox | `pgdata` volume |
-| **Qdrant** | Vector store (dense embeddings, HNSW) | `qdrantdata` volume |
+| **PostgreSQL 17** | Canonical **source of truth** + outbox · RAG **document ledger** (`kb_documents`) | `pgdata` volume |
+| **Qdrant** | Vector store — memories (`lg_memory`) **+ RAG chunks (`kb_chunks`)** | `qdrantdata` volume |
 | **Redis** | Short‑term KV, semantic cache, graph edges, versions | `redisdata` volume |
 
 ---
@@ -42,12 +42,12 @@ harnesses.
 
 ```mermaid
 flowchart LR
-  H["🤖 Harness / Agent"] -->|"HTTP  /mcp"| M["🧠 memory-mcp<br/>FastMCP + dashboard + metrics"]
+  H["🤖 Harness / Agent"] -->|"HTTP  /mcp"| M["🧠 memory-mcp<br/>FastMCP · 45 tools · /ui · /metrics"]
   H -. "stdio (docker run)" .-> M
-  M -->|"source of truth<br/>+ outbox"| PG[("🐘 PostgreSQL 17")]
-  M -->|"vectors + BM25"| Q[("🔎 Qdrant")]
+  M -->|"🧠 memories + 📚 docs<br/>(mem_canonical · kb_documents)"| PG[("🐘 PostgreSQL 17")]
+  M -->|"🧠 lg_memory + BM25<br/>📚 kb_chunks"| Q[("🔎 Qdrant")]
   M -->|"cache · graph · KV · versions"| R[("⚡ Redis")]
-  PG -. "outbox rebuild (derived stores are disposable)" .-> Q
+  PG -. "outbox rebuild (derived = disposable)" .-> Q
   PG -. "rebuild" .-> R
 ```
 
@@ -64,13 +64,16 @@ flowchart LR
 flowchart TD
   S["🚀 Session start"] --> C["📥 Read resource<br/>memory://context"]
   C --> T["💬 User turn"]
-  T --> R["🔍 memory_recall — top‑k relevant"]
+  T --> R["🔍 memory_recall →<br/>memories + knowledge (RAG, cited)"]
   R --> L["🧠 Reason / call tools"]
-  L --> I["📝 memory_turn_ingest<br/>facts + error→fix"]
-  I --> D{"Task done?"}
+  L --> DD{"Saving a document?"}
+  DD -- "yes" --> KI["📚 memory_kb_ingest<br/>(or memory_store: category=documentation → routed)"]
+  DD -- "no" --> I["📝 memory_turn_ingest<br/>facts + error→fix"]
+  KI --> D{"Task done?"}
+  I --> D
   D -- "no" --> T
   D -- "yes" --> E["🏁 memory_task_end / trajectory_close"]
-  E --> N["🌙 Nightly: decay · consolidate · dream · promote"]
+  E --> N["🌙 Nightly: decay · consolidate · dream · promote<br/>+ memory→RAG reconcile"]
 ```
 
 Memory becomes a **reflex**, not a tool the model must remember to call: the harness
@@ -84,12 +87,17 @@ sequenceDiagram
   participant M as memory-mcp
   participant P as PostgreSQL
   participant X as Qdrant / Redis
+  Note over A,X: 🧠 Memory write (durable)
   A->>M: memory_store
   M->>P: 1 txn → mem_canonical + mem_outbox
-  P-->>M: committed ✅
+  P-->>M: committed
   M-->>A: stored (durable)
-  M->>X: outbox worker applies (idempotent, version‑ordered)
-  X-->>M: indexed
+  M->>X: outbox worker applies (idempotent, version-ordered)
+  Note over A,X: 📚 RAG ingest (knowledge)
+  A->>M: memory_kb_ingest  (or memory_store → documentation)
+  M->>X: chunk + embed → kb_chunks (wait=true)
+  M->>P: insert kb_documents (ledger · citations)
+  M-->>A: { doc_id, chunks }
 ```
 
 Postgres is the **only** source of truth. A crash between steps loses nothing — the
@@ -99,13 +107,13 @@ outbox replays. A corrupted vector index is **rebuilt from canonical**.
 
 ```mermaid
 flowchart LR
-  Q["Query"] --> Dense["🧠 Dense<br/>Qwen3‑Embedding‑0.6B"]
-  Q --> Sparse["🔤 BM25"]
-  Dense --> RRF["🧬 RRF fusion"]
-  Sparse --> RRF
-  RRF --> Rerank["🎯 Cross‑encoder rerank"]
-  Rerank --> Filter["🔒 Canonical liveness + scope (RLS)"]
-  Filter --> Out["✅ Results"]
+  Q["Query"] --> MD["🧠 Memory: dense + BM25"]
+  Q --> KD["📚 Knowledge: dense (kb_chunks)"]
+  MD --> RRF["🧬 RRF fusion"]
+  RRF --> RR["🎯 Cross-encoder rerank"]
+  KD --> RR
+  RR --> F["🔒 Canonical liveness + scope (RLS)<br/>· drop stale docs"]
+  F --> O["✅ memories + knowledge (cited)"]
 ```
 
 ### ④ The long‑memory lifecycle
@@ -194,6 +202,22 @@ memory_kb_search { "query": "backup window", "top_k": 5 }
 - **Memory updates RAG** — `memory_kb_reconcile` / `MEMORY_KB_AUTOSYNC`.
 
 Reuses the same embeddings, cross-encoder reranker, scope auth and durability — one stack, two lanes: **memory = what's true about you, RAG = what's true in your files.**
+
+---
+
+## 🔗 Two lanes, fully wired
+
+```mermaid
+flowchart LR
+  MS["memory_store"] -->|"category=documentation / long doc"| KB["📚 Knowledge base (RAG)"]
+  MS -->|"facts"| MEM["🧠 Memory"]
+  RC["memory_recall"] --> MEM
+  RC --> KB
+  MEM -->|"new confirmed truth"| REC["memory_kb_reconcile / AUTOSYNC"]
+  REC -->|"mark stale + append update"| KB
+```
+
+> Save docs → they land in RAG. Recall → it checks both. New truth → RAG gets corrected.
 
 ---
 
