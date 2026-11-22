@@ -1,0 +1,11 @@
+{
+  "mcp": {
+    "memory": {
+      "type": "remote",
+      "url": "http://127.0.0.1:4000/mcp",
+      "enabled": true
+      // With token auth enabled, add:
+      // "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}

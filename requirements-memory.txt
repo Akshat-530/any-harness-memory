@@ -1,0 +1,15 @@
+# Memory MCP runtime (isolated venv: torch CPU + embeddings).
+# torch itself is installed from the CPU wheel index in the Dockerfile.
+sentence-transformers>=3.0
+qdrant-client>=1.10
+psycopg[binary,pool]>=3.2
+pg8000>=1.30
+redis>=5.0
+bm25s>=0.2
+tiktoken>=0.7
+numpy
+mcp>=1.2
+alembic>=1.13
+sqlalchemy>=2.0
+starlette>=0.38
+uvicorn>=0.30

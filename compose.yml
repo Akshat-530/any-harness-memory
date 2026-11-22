@@ -1,0 +1,125 @@
+# Memory — self-contained semantic memory stack.
+#   qdrant   : vector store (dense + BM25 payloads)
+#   postgres : canonical durable ledger (source of truth + transactional outbox)
+#   redis    : short-term KV, semantic cache, graph edges, version snapshots
+#   memory-mcp : the FastMCP server + dashboard + /metrics (the only published port)
+#
+# Nothing is exposed except memory-mcp on the host loopback. Copied from .env
+# (see .env.example); never commit a real .env.
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    mem_limit: 2g
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+      - QDRANT__TELEMETRY_DISABLED=true
+      - QDRANT_CONFIG=/qdrant/config.yaml
+    volumes:
+      - ./config/qdrant.yaml:/qdrant/config.yaml:ro
+      - qdrantdata:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/6333"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [memory]
+
+  redis:
+    image: redis:latest
+    restart: unless-stopped
+    mem_limit: 1g
+    command: sh -c 'exec redis-server /usr/local/etc/redis/redis.conf --requirepass "$$MEMORY_REDIS_PASSWORD"'
+    environment:
+      - MEMORY_REDIS_PASSWORD=${MEMORY_REDIS_PASSWORD:-change-me-redis}
+    volumes:
+      - ./config/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$MEMORY_REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [memory]
+
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    mem_limit: 2g
+    environment:
+      - POSTGRES_USER=${MEMORY_PG_USER:-memory}
+      - POSTGRES_PASSWORD=${MEMORY_PG_PASSWORD:-change-me-postgres}
+      - POSTGRES_DB=${MEMORY_PG_DB:-memory}
+      - PGDATA=/var/lib/postgresql/data
+    volumes:
+      - ./config/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./config/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - pgdata:/var/lib/postgresql/data
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf -c hba_file=/etc/postgresql/pg_hba.conf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${MEMORY_PG_USER:-memory} -d ${MEMORY_PG_DB:-memory} || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [memory]
+
+  memory-mcp:
+    build: .
+    image: memory:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    environment:
+      - MEMORY_HTTP_HOST=0.0.0.0
+      - MEMORY_HTTP_PORT=4000
+      - MEMORY_PG_HOST=postgres
+      - MEMORY_PG_PORT=5432
+      - MEMORY_PG_DB=${MEMORY_PG_DB:-memory}
+      - MEMORY_PG_USER=${MEMORY_PG_USER:-memory}
+      - MEMORY_PG_PASSWORD=${MEMORY_PG_PASSWORD:-change-me-postgres}
+      - MEMORY_REDIS_HOST=redis
+      - MEMORY_REDIS_PORT=6379
+      - MEMORY_REDIS_PASSWORD=${MEMORY_REDIS_PASSWORD:-change-me-redis}
+      - QDRANT_URL=http://qdrant:6333
+      - MEMORY_BM25_PATH=/data/bm25_index.json
+      - MEMORY_PRINCIPAL=${MEMORY_PRINCIPAL:-global}
+      - MEMORY_ALLOW_ANONYMOUS=${MEMORY_ALLOW_ANONYMOUS:-1}
+      - MEMORY_ANON_IDENTITY=${MEMORY_ANON_IDENTITY:-local}
+      - MEMORY_AUTH_TOKENS=${MEMORY_AUTH_TOKENS:-}
+      - HORIZONTAL_SCALING_ENABLED=1
+      - MEMORY_EAGER_PREWARM=${MEMORY_EAGER_PREWARM:-1}
+      - MEMORY_OUTBOX_SYNC_GRACE_SECONDS=${MEMORY_OUTBOX_SYNC_GRACE_SECONDS:-5}
+      - MEMORY_TORCH_THREADS=${MEMORY_TORCH_THREADS:-3}
+      - MEMORY_JUDGE_ENDPOINT=${MEMORY_JUDGE_ENDPOINT:-}
+      - MEMORY_JUDGE_MODEL=${MEMORY_JUDGE_MODEL:-}
+      - MEMORY_JUDGE_API_KEY=${MEMORY_JUDGE_API_KEY:-}
+      - MEMORY_CONFLICT_LLM=${MEMORY_CONFLICT_LLM:-0}
+      - VIRTUAL_CONTEXT_ENABLED=${VIRTUAL_CONTEXT_ENABLED:-1}
+      - MEMORY_TOOL_PROFILE=${MEMORY_TOOL_PROFILE:-agent}
+      - MEMORY_MAINTENANCE=${MEMORY_MAINTENANCE:-1}
+    volumes:
+      - memdata:/data
+    ports:
+      - "127.0.0.1:${MEMORY_HTTP_PORT_HOST:-4000}:4000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 4000), timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
+    networks: [memory]
+
+volumes:
+  qdrantdata:
+  redisdata:
+  pgdata:
+  memdata:
+
+networks:
+  memory:
+    driver: bridge

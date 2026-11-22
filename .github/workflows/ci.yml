@@ -1,0 +1,26 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compose config is valid
+        run: docker compose config -q
+      - name: Python syntax
+        run: |
+          python3 - <<'PY'
+          import ast, pathlib
+          files = list(pathlib.Path("app").rglob("*.py"))
+          for f in files:
+              ast.parse(f.read_text(encoding="utf-8"), str(f))
+          print(f"{len(files)} files OK")
+          PY
+      - name: Shell syntax
+        run: |
+          for f in $(find . -name '*.sh'); do sh -n "$f"; done
+          echo "shell OK"

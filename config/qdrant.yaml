@@ -1,0 +1,48 @@
+# Qdrant - the vector store: dense embeddings + BM25 payloads for memory recall
+# Right-sized: hundreds of thousands of vectors max, in-RAM index for speed
+service:
+  host: 0.0.0.0
+  port: 6333
+  grpc_port: 6334
+  max_wait_time_for_initial_startup: 60
+
+# Report memory pressure honestly (memory health checks read this)
+memory_status:
+  enabled: true
+
+# Graceful shutdown: let in-flight queries finish
+graceful_wait_before_exit: 30
+
+storage:
+  wal:
+    wal_capacity_mb: 32
+    wal_segments: 2
+
+  # Bounded but generous; memory grows slowly (single user)
+  max_collection_size: 1000000
+
+  # Payload on disk (large text blobs), index in RAM (fast recall)
+  on_disk:
+    index: false
+    payload: true
+
+  # Optimizer: 4 segments total - 10 fragmented tiny collections and
+  # multiplied HNSW graphs for no benefit at this scale
+  optimizer:
+    deleted_threshold: 0.3
+    vacuum_min_vector_count: 1000
+    default_number_of_segments: 4
+    indexing_threshold: 20000
+
+  # HNSW: m=16/ef_construct=100 gives ~0.99 recall at this scale;
+  # m=32/ef=120 doubled memory + build time for negligible gain
+  hnsw:
+    m: 16
+    ef_construct: 100
+    full_scan_threshold: 10000
+    payload_m: 8
+    payload_ef_construct: 100
+    payload_index_threshold: 2000
+
+telemetry:
+  disabled: true

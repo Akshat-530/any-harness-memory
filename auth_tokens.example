@@ -1,0 +1,9 @@
+# Memory — credential store. One line per caller.
+#   sha256:<hex-digest>|<identity>|<comma-separated scopes>
+# The digest is sha256 of the raw bearer token. The token itself is NEVER stored.
+# Mint a token:  printf '%s' "$(openssl rand -hex 32)" | tee mytoken ; \
+#                sha256sum  (paste the digest into a line below)
+#
+# Example (replace digests and identities with your own):
+# sha256:0000000000000000000000000000000000000000000000000000000000000000|admin|global,user:admin
+# sha256:1111111111111111111111111111111111111111111111111111111111111111|alice|user:alice

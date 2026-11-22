@@ -1,0 +1,12 @@
+.git
+.gitignore
+.env
+.env.*
+auth_tokens
+auth_tokens.example
+*.log
+**/__pycache__/
+**/*.pyc
+app/tools/logs/
+app/bm25_index.json
+README.md

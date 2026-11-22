@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "memory": {
+      "command": "docker",
+      "args": [
+        "compose",
+        "-f", "<ABSOLUTE_PATH_TO>/memory-mcp/compose.yml",
+        "run", "--rm", "-T", "--entrypoint", "python",
+        "memory-mcp", "/app/memory_server.py"
+      ],
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}

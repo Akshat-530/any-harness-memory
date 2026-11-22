@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+auth_tokens
+!auth_tokens.example
+app/bm25_index.json
+app/tools/logs/
+**/__pycache__/
+**/*.pyc
+*.log
+data/

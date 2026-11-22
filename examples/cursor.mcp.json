@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "memory": {
+      "url": "http://127.0.0.1:4000/mcp"
+    },
+    "memory-bridge": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "http://127.0.0.1:4000/mcp"]
+    }
+  }
+}
