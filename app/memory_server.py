@@ -124,6 +124,16 @@ COLLECTION_NAME = "lg_memory"
 EMBEDDING_MODEL = os.environ.get("MEMORY_EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B")
 EMBEDDING_MODEL_VERSION = os.environ.get("MEMORY_EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B")
 VECTOR_SIZE = int(os.environ.get("MEMORY_VECTOR_SIZE", "1024"))
+# RAG / knowledge-base lane (documents), kept separate from memories.
+KB_COLLECTION = os.environ.get("MEMORY_KB_COLLECTION", "kb_chunks")
+KB_CHUNK_SIZE = int(os.environ.get("MEMORY_KB_CHUNK_SIZE", "900"))
+KB_CHUNK_OVERLAP = int(os.environ.get("MEMORY_KB_CHUNK_OVERLAP", "150"))
+KB_AUTOSYNC = os.environ.get("MEMORY_KB_AUTOSYNC", "").strip() == "1"
+KB_RECONCILE_THRESHOLD = float(os.environ.get("MEMORY_KB_RECONCILE_THRESHOLD", "0.80"))
+KB_SYNC_MIN_IMPORTANCE = int(os.environ.get("MEMORY_KB_SYNC_MIN_IMPORTANCE", "7"))
+# Routing: documentation-like writes go to RAG; recall also searches RAG.
+DOC_ROUTE_CHARS = int(os.environ.get("MEMORY_DOC_ROUTE_CHARS", "2000"))
+RECALL_INCLUDE_KB = os.environ.get("MEMORY_RECALL_INCLUDE_KB", "").strip() == "1"
 # Cross-encoder reranker for post-recall precision. Empty string = disabled.
 # Default: ms-marco-MiniLM-L6-v2 (~500MB RAM, ~50ms for 50 pairs on 4-core CPU).
 RERANKER_MODEL = os.environ.get("MEMORY_RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L6-v2")
@@ -1728,6 +1738,290 @@ if os.environ.get("MEMORY_EAGER_PREWARM") == "1":
 # The new env-driven RERANKER_MODEL is the single source of truth.
 # ---------------------------------------------------------------------------
 
+# ===========================================================================
+# RAG / KNOWLEDGE BASE — documents lane (separate collection, same stack)
+# ===========================================================================
+def _kb_ensure_collection() -> None:
+    try:
+        _client.get_collection(KB_COLLECTION)
+        return
+    except UnexpectedResponse:
+        pass
+    except Exception as _e:
+        log.warning("kb collection check failed: %s", _e)
+        return
+    try:
+        _client.create_collection(
+            collection_name=KB_COLLECTION,
+            vectors_config=qmodels.VectorParams(size=VECTOR_SIZE, distance=qmodels.Distance.COSINE),
+            hnsw_config=qmodels.HnswConfigDiff(m=16, ef_construct=128, full_scan_threshold=10000, max_indexing_threads=4),
+            optimizers_config=qmodels.OptimizersConfigDiff(indexing_threshold=20000),
+        )
+        for _f in ("scope", "doc_id", "source"):
+            try:
+                _client.create_payload_index(collection_name=KB_COLLECTION, field_name=_f,
+                                             field_schema=qmodels.PayloadSchemaType.KEYWORD)
+            except Exception:
+                pass
+        log.info("KB collection '%s' created", KB_COLLECTION)
+    except Exception as _e:
+        log.warning("KB collection create failed (non-fatal): %s", _e)
+
+def _kb_chunk(text: str, size: int = KB_CHUNK_SIZE, overlap: int = KB_CHUNK_OVERLAP) -> list[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    chunks, i, n = [], 0, len(text)
+    while i < n:
+        end = min(i + size, n)
+        if end < n:
+            window = text[i:end]
+            for sep in ("\n\n", "\n", ". "):
+                pos = window.rfind(sep)
+                if pos > size * 0.5:
+                    end = i + pos + len(sep)
+                    break
+        chunks.append(text[i:end].strip())
+        if end >= n:
+            break
+        i = max(end - overlap, i + 1)
+    return [c for c in chunks if c]
+
+def _kb_embed(texts: list[str]) -> list[list[float]]:
+    return _embed_model().encode(list(texts), convert_to_numpy=True).tolist()
+
+def _kb_rerank(query: str, cands: list[tuple]) -> list[tuple]:
+    ce = _get_cross_encoder()
+    if ce is None:
+        return cands
+    try:
+        scores = ce.predict([(query, (c[2].get("content") or "")) for c in cands])
+        order = sorted(range(len(cands)), key=lambda i: float(scores[i]), reverse=True)
+        return [(cands[i][0], float(scores[i]), cands[i][2]) for i in order]
+    except Exception as _e:
+        log.warning("kb rerank failed: %s", _e)
+        return cands
+
+def _kb_pg(r, k, i):
+    return r.get(k) if (isinstance(r, dict) or hasattr(r, "keys")) else r[i]
+
+def _kb_add_document(text: str, source: str, title: str, scope: str, meta: dict | None = None) -> dict:
+    import hashlib
+    meta = meta or {}
+    chunks = _kb_chunk(text)
+    if not chunks:
+        raise ValueError("no content after chunking")
+    doc_id = hashlib.sha256((str(scope) + "|" + source + "|" + text).encode("utf-8")).hexdigest()[:32]
+    vecs = _kb_embed(chunks)
+    now = _now_iso()
+    points = []
+    for idx, (chunk, vec) in enumerate(zip(chunks, vecs)):
+        pl = {"scope": scope, "doc_id": doc_id, "source": source, "title": title,
+              "chunk_index": idx, "n_chunks": len(chunks), "content": chunk,
+              "kind": "kb", "created_at": now}
+        for k in ("url", "page", "section", "tags"):
+            if isinstance(meta.get(k), (str, int)):
+                pl[k] = meta[k]
+        _pid = str(uuid.uuid5(uuid.NAMESPACE_URL, "%s:%d" % (doc_id, idx)))
+        points.append(qmodels.PointStruct(id=_pid, vector=vec, payload=pl))
+    try:
+        _client.delete(collection_name=KB_COLLECTION, points_selector=qmodels.FilterSelector(
+            filter=qmodels.Filter(must=[qmodels.FieldCondition(key="doc_id", match=qmodels.MatchValue(value=doc_id))])))
+    except Exception:
+        pass
+    _client.upsert(collection_name=KB_COLLECTION, points=points, wait=True)
+    try:
+        _pg_run("INSERT INTO kb_documents(doc_id,scope,source,title,checksum,n_chunks,status,payload,updated_at) "
+                "VALUES (:d,:s,:src,:t,:c,:n,'active',:p,now()) "
+                "ON CONFLICT (doc_id) DO UPDATE SET scope=EXCLUDED.scope, source=EXCLUDED.source, "
+                "title=EXCLUDED.title, checksum=EXCLUDED.checksum, n_chunks=EXCLUDED.n_chunks, "
+                "status='active', payload=EXCLUDED.payload, updated_at=now()",
+                {"d": doc_id, "s": scope, "src": source, "t": title, "c": doc_id,
+                 "n": len(chunks), "p": json.dumps(meta)})
+    except Exception as _e:
+        log.warning("kb_documents upsert failed: %s", _e)
+    return {"doc_id": doc_id, "source": source, "scope": scope, "chunks": len(chunks)}
+
+def _tool_kb_ingest(args: dict) -> types.CallToolResult:
+    text = args.get("text") or ""
+    source = (args.get("source") or args.get("title") or "inline").strip()
+    title = (args.get("title") or source).strip()
+    scope = authorize_scope(args.get("scope"))
+    meta = args.get("metadata") if isinstance(args.get("metadata"), dict) else {}
+    if not text.strip():
+        return _err("memory_kb_ingest: 'text' is required")
+    try:
+        info = _kb_add_document(text, source, title, scope, meta)
+    except Exception as _e:
+        return _err(f"memory_kb_ingest: {_e}")
+    return _ok(json.dumps(info, ensure_ascii=False))
+
+def _tool_kb_search(args: dict) -> types.CallToolResult:
+    query = (args.get("query") or "").strip()
+    if not query:
+        return _err("memory_kb_search: 'query' is required")
+    top_k = min(int(args.get("top_k") or 6), 50)
+    scope = authorize_scope(args.get("scope"))
+    source = args.get("source")
+    qvec = _embed_model().encode(query).tolist()
+    must = [qmodels.FieldCondition(key="scope", match=qmodels.MatchValue(value=scope))]
+    if source:
+        must.append(qmodels.FieldCondition(key="source", match=qmodels.MatchValue(value=source)))
+    must_not = [] if args.get("include_stale") else [
+        qmodels.FieldCondition(key="stale", match=qmodels.MatchValue(value=True))]
+    try:
+        hits = _client.query_points(
+            collection_name=KB_COLLECTION, query=qvec, limit=max(top_k * 4, 20),
+            query_filter=qmodels.Filter(must=must, must_not=must_not), with_payload=True).points
+    except UnexpectedResponse:
+        return _err("memory_kb_search: knowledge base is empty (ingest a document first)")
+    if not hits:
+        return _ok(json.dumps({"query": query, "count": 0, "results": []}, ensure_ascii=False))
+    cands = [(h.id, float(h.score), (h.payload or {})) for h in hits]
+    cands = _kb_rerank(query, cands)
+    results = []
+    for pid, score, pl in cands[:top_k]:
+        results.append({"doc_id": pl.get("doc_id"), "source": pl.get("source"),
+                        "title": pl.get("title"), "chunk_index": pl.get("chunk_index"),
+                        "score": round(float(score), 4),
+                        "citation": f"{pl.get('source')}#{pl.get('chunk_index')}",
+                        "content": pl.get("content")})
+    return _ok(json.dumps({"query": query, "count": len(results), "results": results},
+                          ensure_ascii=False, indent=2))
+
+def _tool_kb_sources(args: dict) -> types.CallToolResult:
+    scope = authorize_scope(args.get("scope"))
+    try:
+        rows = _pg_query("SELECT doc_id,source,title,n_chunks,created_at FROM kb_documents "
+                         "WHERE scope=:s AND status='active' ORDER BY created_at DESC LIMIT 200",
+                         {"s": scope})
+    except Exception as _e:
+        return _err(f"memory_kb_sources: {_e}")
+    out = []
+    for r in rows:
+        ca = _kb_pg(r, "created_at", 4)
+        out.append({"doc_id": _kb_pg(r, "doc_id", 0), "source": _kb_pg(r, "source", 1),
+                    "title": _kb_pg(r, "title", 2), "n_chunks": _kb_pg(r, "n_chunks", 3),
+                    "created_at": ca.isoformat() if hasattr(ca, "isoformat") else ca})
+    return _ok(json.dumps({"count": len(out), "sources": out}, ensure_ascii=False, indent=2))
+
+def _tool_kb_delete(args: dict) -> types.CallToolResult:
+    doc_id = args.get("doc_id")
+    source = args.get("source")
+    scope = authorize_scope(args.get("scope"))
+    if not (doc_id or source):
+        return _err("memory_kb_delete: doc_id or source is required")
+    def _del_doc(d):
+        _client.delete(collection_name=KB_COLLECTION, points_selector=qmodels.FilterSelector(
+            filter=qmodels.Filter(must=[
+                qmodels.FieldCondition(key="doc_id", match=qmodels.MatchValue(value=d)),
+                qmodels.FieldCondition(key="scope", match=qmodels.MatchValue(value=scope))])))
+    if doc_id:
+        _del_doc(doc_id)
+        _pg_run("DELETE FROM kb_documents WHERE doc_id=:d AND scope=:s", {"d": doc_id, "s": scope})
+        return _ok(json.dumps({"deleted": {"doc_id": doc_id}}))
+    docs = _pg_query("SELECT doc_id FROM kb_documents WHERE source=:src AND scope=:s",
+                     {"src": source, "s": scope})
+    ids = [_kb_pg(r, "doc_id", 0) for r in docs]
+    for d in ids:
+        _del_doc(d)
+    _pg_run("DELETE FROM kb_documents WHERE source=:src AND scope=:s", {"src": source, "s": scope})
+    return _ok(json.dumps({"deleted": {"source": source, "documents": len(ids)}}))
+
+def _kb_mark_stale(doc_id, chunk_index, memory_id) -> bool:
+    try:
+        _client.set_payload(
+            collection_name=KB_COLLECTION,
+            payload={"stale": True, "superseded_by": memory_id, "stale_since": _now_iso()},
+            points=qmodels.Filter(must=[
+                qmodels.FieldCondition(key="doc_id", match=qmodels.MatchValue(value=doc_id)),
+                qmodels.FieldCondition(key="chunk_index", match=qmodels.MatchValue(value=chunk_index))]))
+        return True
+    except Exception as _e:
+        log.warning("kb mark stale failed: %s", _e)
+        return False
+
+def _kb_reconcile(content: str, scope: str, memory_id: str | None = None,
+                  max_candidates: int = 6) -> dict:
+    if not content or not content.strip():
+        return {"marked": [], "updated": False}
+    low = content.lower()
+    has_neg = any(m in low for m in _NEGATION_MARKERS)
+    qv = _embed_model().encode(content).tolist()
+    must = [qmodels.FieldCondition(key="scope", match=qmodels.MatchValue(value=scope))]
+    try:
+        hits = _client.query_points(collection_name=KB_COLLECTION, query=qv,
+                limit=max(max_candidates * 3, 12), query_filter=qmodels.Filter(must=must),
+                with_payload=True).points
+    except Exception:
+        return {"marked": [], "updated": False}
+    marked, src0 = [], None
+    for h in hits:
+        pl = h.payload or {}
+        if pl.get("stale") or pl.get("kind") == "kb-update":
+            continue
+        if float(h.score) >= KB_RECONCILE_THRESHOLD and has_neg:
+            if _kb_mark_stale(pl.get("doc_id"), pl.get("chunk_index"), memory_id):
+                marked.append({"source": pl.get("source"), "chunk_index": pl.get("chunk_index"),
+                               "score": round(float(h.score), 3)})
+                if src0 is None:
+                    src0 = pl.get("source")
+    updated = False
+    if marked and src0:
+        try:
+            _kb_add_document("UPDATE: %s (supersedes earlier content in %s)" % (content, src0),
+                             "%s#update" % src0, "Update for %s" % src0, scope,
+                             {"kind": "kb-update", "supersedes": src0, "memory_id": memory_id})
+            updated = True
+        except Exception as _e:
+            log.warning("kb update append failed: %s", _e)
+    return {"marked": marked, "updated": updated}
+
+def _kb_reconcile_safe(content: str, scope: str, memory_id: str | None = None) -> None:
+    try:
+        _kb_reconcile(content, scope, memory_id)
+    except Exception as _e:
+        log.warning("kb auto-reconcile failed: %s", _e)
+
+def _tool_kb_reconcile(args: dict) -> types.CallToolResult:
+    scope = authorize_scope(args.get("scope"))
+    memory_id = args.get("memory_id")
+    content = args.get("content")
+    if memory_id and not content:
+        row = _canonical_row(memory_id)
+        if row:
+            content = row.get("content")
+    if not content:
+        return _err("memory_kb_reconcile: provide memory_id or content")
+    res = _kb_reconcile(content, scope, memory_id)
+    return _ok(json.dumps({"scope": scope, "marked": res["marked"],
+                           "update_chunk": res["updated"]}, ensure_ascii=False, indent=2))
+
+def _looks_like_document(text: str) -> bool:
+    if not isinstance(text, str) or text.count("\n") < 3:
+        return False
+    return ("```" in text) or ("\n#" in text) or ("\n- " in text) or ("\n1. " in text) or ("\n* " in text)
+
+def _kb_recall_hits(query: str, scope: str, top_k: int = 5) -> list[dict]:
+    try:
+        qv = _embed_model().encode(query).tolist()
+        hits = _client.query_points(
+            collection_name=KB_COLLECTION, query=qv, limit=max(1, top_k),
+            query_filter=qmodels.Filter(
+                must=[qmodels.FieldCondition(key="scope", match=qmodels.MatchValue(value=scope))],
+                must_not=[qmodels.FieldCondition(key="stale", match=qmodels.MatchValue(value=True))]),
+            with_payload=True).points
+    except Exception:
+        return []
+    out = []
+    for h in hits:
+        pl = h.payload or {}
+        out.append({"lane": "knowledge", "source": pl.get("source"), "title": pl.get("title"),
+                    "chunk_index": pl.get("chunk_index"),
+                    "citation": "%s#%s" % (pl.get("source"), pl.get("chunk_index")),
+                    "score": round(float(h.score), 4), "content": pl.get("content")})
+    return out
+
 try:
     coll_info = _client.get_collection(COLLECTION_NAME)
     count = coll_info.points_count
@@ -1773,6 +2067,11 @@ except UnexpectedResponse:
         log.info("Qdrant collection '%s' created", COLLECTION_NAME)
     except Exception as _e:
         log.warning("Qdrant collection create failed (non-fatal): %s", _e)
+
+try:
+    _kb_ensure_collection()
+except Exception as _kbe:
+    log.warning("KB ensure failed (non-fatal): %s", _kbe)
 
 # ---------------------------------------------------------------------------
 # Redis client for short-term memory
@@ -2099,6 +2398,23 @@ def _pg_audit(op: str, memory_id: str = None, detail: dict = None,
 _CANONICAL_STATUSES = ("pending_index", "active", "index_failed",
                        "superseded", "deleted")
 
+_KB_DDL = """
+CREATE TABLE IF NOT EXISTS kb_documents (
+    doc_id     text PRIMARY KEY,
+    scope      text NOT NULL,
+    source     text,
+    title      text,
+    checksum   text,
+    n_chunks   int NOT NULL DEFAULT 0,
+    status     text NOT NULL DEFAULT 'active',
+    payload    jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS kb_documents_scope_idx  ON kb_documents (scope);
+CREATE INDEX IF NOT EXISTS kb_documents_source_idx ON kb_documents (source);
+"""
+
 _CANONICAL_DDL = """
 CREATE TABLE IF NOT EXISTS mem_canonical (
     memory_id    text PRIMARY KEY,
@@ -2289,7 +2605,7 @@ def _ensure_canonical_schema() -> bool:
         if _pg_conn is None:
             return False
     try:
-        _pg_txn_execute([(_CANONICAL_DDL, {}), (_OUTBOX_DDL, {}), (_TRAJECTORY_STEPS_DDL, {})])
+        _pg_txn_execute([(_CANONICAL_DDL, {}), (_OUTBOX_DDL, {}), (_TRAJECTORY_STEPS_DDL, {}), (_KB_DDL, {})])
         log.info("canonical schema ready (mem_canonical + mem_outbox + mem_trajectory_steps)")
         return True
     except Exception as _e:  # pragma: no cover - defensive
@@ -7399,6 +7715,40 @@ _SERVER_TOOLS.append(types.Tool(
         "required": ["memory_id"],
     },
 ))
+_SERVER_TOOLS.append(types.Tool(
+    name="memory_kb_ingest", version="1.0.0",
+    description=("RAG — ingest a document into the knowledge base (separate from memories). "
+                 "Chunks + embeds the text and stores it with source citations. Idempotent per source+content."),
+    inputSchema={"type": "object", "properties": {
+        "text": {"type": "string"}, "source": {"type": "string"}, "title": {"type": "string"},
+        "metadata": {"type": "object"}, "scope": {"type": "string"}}, "required": ["text"]},
+))
+_SERVER_TOOLS.append(types.Tool(
+    name="memory_kb_search", version="1.0.0",
+    description=("RAG — search ingested documents and return the most relevant chunks with citations "
+                 "(source#chunk). Filter by scope or source."),
+    inputSchema={"type": "object", "properties": {
+        "query": {"type": "string"}, "top_k": {"type": "integer"},
+        "source": {"type": "string"}, "scope": {"type": "string"}}, "required": ["query"]},
+))
+_SERVER_TOOLS.append(types.Tool(
+    name="memory_kb_sources", version="1.0.0",
+    description="RAG — list documents ingested into the knowledge base (newest first).",
+    inputSchema={"type": "object", "properties": {"scope": {"type": "string"}}},
+))
+_SERVER_TOOLS.append(types.Tool(
+    name="memory_kb_delete", version="1.0.0",
+    description="RAG — delete a document and all its chunks by doc_id or by source.",
+    inputSchema={"type": "object", "properties": {
+        "doc_id": {"type": "string"}, "source": {"type": "string"}, "scope": {"type": "string"}}},
+))
+_SERVER_TOOLS.append(types.Tool(
+    name="memory_kb_reconcile", version="1.0.0",
+    description=("RAG — reconcile memory into knowledge: a confirmed memory marks contradicting document "
+                 "chunks as stale (reversible, never deleted) and appends an update chunk. Provide memory_id or content."),
+    inputSchema={"type": "object", "properties": {
+        "memory_id": {"type": "string"}, "content": {"type": "string"}, "scope": {"type": "string"}}},
+))
 
 _TOOL_PROFILE = os.environ.get("MEMORY_TOOL_PROFILE", "full").strip().lower()
 _AGENT_TOOLS = frozenset({
@@ -7408,6 +7758,11 @@ _AGENT_TOOLS = frozenset({
     "memory_auto_observe",
     "memory_turn_ingest",
     "memory_timeline",
+    "memory_kb_ingest",
+    "memory_kb_search",
+    "memory_kb_sources",
+    "memory_kb_delete",
+    "memory_kb_reconcile",
     "memory_task_end",
     "memory_trajectory_log",
     "memory_trajectory_recall",
@@ -7733,6 +8088,12 @@ _DATA_TOOLS = frozenset({
     "memory_turn_ingest",
     # Timeline
     "memory_timeline",
+    # RAG / knowledge base
+    "memory_kb_ingest",
+    "memory_kb_search",
+    "memory_kb_sources",
+    "memory_kb_delete",
+    "memory_kb_reconcile",
     # versions
     "memory_versions", "memory_version_get", "memory_version_restore",
     # short-term (Redis) store -- previously had NO scope at all
@@ -8400,6 +8761,16 @@ async def _dispatch_tool(name: str, arguments: dict) -> types.CallToolResult:
         return _tool_turn_ingest(arguments)
     if name == "memory_timeline":
         return _tool_timeline(arguments)
+    if name == "memory_kb_ingest":
+        return _tool_kb_ingest(arguments)
+    if name == "memory_kb_search":
+        return _tool_kb_search(arguments)
+    if name == "memory_kb_sources":
+        return _tool_kb_sources(arguments)
+    if name == "memory_kb_delete":
+        return _tool_kb_delete(arguments)
+    if name == "memory_kb_reconcile":
+        return _tool_kb_reconcile(arguments)
     if name == "memory_merge_identities":
         return _tool_merge_identities(arguments)
     if name == "memory_export_audit_log":
@@ -8795,6 +9166,36 @@ _server = Server(
 def _tool_store(args: dict) -> types.CallToolResult:
     _start = time.perf_counter()
     content = args["content"]
+
+    # Documentation routing: documentation-like content goes to the RAG lane,
+    # NOT to memory. Explicit category/flag, or a long structured document.
+    _cat = (args.get("category") or "").strip().lower()
+    _doc = (_cat in ("documentation", "doc", "docs", "kb", "knowledge")
+            or bool(args.get("documentation"))
+            or str(args.get("kind", "")).lower() in ("document", "documentation"))
+    if not _doc and DOC_ROUTE_CHARS > 0:
+        _t = args.get("content") or ""
+        if len(_t) >= DOC_ROUTE_CHARS and _looks_like_document(_t):
+            _doc = True
+    if _doc:
+        _rej, _find, _masked = _scan_secrets(args.get("content") or "")
+        if _rej:
+            _pg_audit("secret_block", None, {"findings": _find, "via": "doc_route"})
+            return _err(json.dumps({"blocked": True, "gate": "secret_detection",
+                                    "findings": _find}, ensure_ascii=False))
+        try:
+            _info = _kb_add_document(
+                _masked,
+                (args.get("source") or args.get("title") or "documentation").strip(),
+                (args.get("title") or "Documentation").strip(),
+                authorize_scope(args.get("scope")),
+                {"routed_from": "memory_store", "category": args.get("category") or "documentation"})
+        except Exception as _e:
+            return _err("memory_store: documentation routing failed: %s" % _e)
+        _info["routed_to"] = "rag"
+        _info["lane"] = "knowledge"
+        _op_telemetry_record("write_gate", 0.0, "routed_to_rag")
+        return _ok(json.dumps(_info, ensure_ascii=False))
 
     # 3B-2: secret/PII gate runs BEFORE anything else. Credential-shaped
     # content rejects the write (fail closed, audited); PII is masked to
@@ -9357,6 +9758,14 @@ def _tool_store(args: dict) -> types.CallToolResult:
     _WRITE_GATE_STATS["stored"] += 1
     _WRITE_GATE_STATS["by_source"][source]["stored"] += 1
     _op_telemetry_record("write_gate", 0.0, "stored", quality_score=q_score)
+    try:
+        if KB_AUTOSYNC and importance >= KB_SYNC_MIN_IMPORTANCE and not findings:
+            import threading as _th
+            _th.Thread(target=_kb_reconcile_safe,
+                       kwargs={"content": content, "scope": scope, "memory_id": memory_id},
+                       daemon=True).start()
+    except Exception:
+        pass
     # Sprint-1 1.2: async LLM plausibility pass for high-stakes memories.
     if importance >= 7 or category == "fact":
         _judge_enqueue(memory_id, content)
@@ -9512,6 +9921,14 @@ def _tool_recall(args: dict) -> types.CallToolResult:
             "memories": _filter_canonical(cached_memories, as_of),
             "cache_hit": True,
         }
+        if RECALL_INCLUDE_KB:
+            try:
+                _kbs = _kb_recall_hits(query, authorize_scope(args.get("scope")), max(3, (top_k or 5)))
+                if _kbs:
+                    result["knowledge"] = _kbs
+                    result["knowledge_count"] = len(_kbs)
+            except Exception:
+                pass
         _RECALL_SESSION_STATS["cache_hits"] += 1
         _RECALL_SESSION_STATS["total_memories_returned"] += len(cached_memories)
         log.info("recall cache_hit query=%s count=%d", query[:40], len(cached_memories))
@@ -9749,6 +10166,14 @@ def _tool_recall(args: dict) -> types.CallToolResult:
     _record_stage_latency("canonical_filter", (time.perf_counter() - _canon_start) * 1000)
     _record_stage_quality("canonical_filter", 1.0 if len(memories) > 0 else 0.0)
     result = {"query": query, "query_type": query_type, "count": len(memories), "memories": memories}
+    if RECALL_INCLUDE_KB:
+        try:
+            _kbs = _kb_recall_hits(query, authorize_scope(args.get("scope")), max(3, (top_k or 5)))
+            if _kbs:
+                result["knowledge"] = _kbs
+                result["knowledge_count"] = len(_kbs)
+        except Exception:
+            pass
     # 2C-2: graph-adjacent expansion — the "connected memory" experience:
     # expand the top hit via the durable graph (depth 1) and inject up to
     # N neighbors not already in the result set, explicitly marked. Reads

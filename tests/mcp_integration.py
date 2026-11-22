@@ -1,4 +1,4 @@
-"""Full-stack MCP integration test — store/get/recall/list/stats/graph/context/
+﻿"""Full-stack MCP integration test â€” store/get/recall/list/stats/graph/context/
 resources/turn-ingest/health through the live endpoint, as a harness would.
 
     docker run --rm --network "$(basename $PWD)_memory" --entrypoint python \
@@ -31,7 +31,7 @@ async def _eventually(fn, pred, tries=8, delay=2.0):
 
 async def main():
     async with streamable_http_client(URL) as (r, w):
-        async with ClientSession(r, w) as s:
+        async with ClientSession(r, w, read_timeout_seconds=60) as s:
             await s.initialize()
             tools = [t.name for t in (await s.list_tools()).tools]
             assert len(tools) >= 30, len(tools)

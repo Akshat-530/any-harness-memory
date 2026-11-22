@@ -22,7 +22,7 @@ def _ids(rec):
 
 async def main():
     async with streamable_http_client(URL) as (r, w):
-        async with ClientSession(r, w) as s:
+        async with ClientSession(r, w, read_timeout_seconds=60) as s:
             await s.initialize()
 
             # 1) event_time is stored and surfaced (isolated memory)
@@ -75,3 +75,4 @@ async def main():
 
 
 asyncio.run(main())
+

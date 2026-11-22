@@ -1,4 +1,4 @@
-"""End-to-end smoke test for the Memory container (profile-agnostic).
+﻿"""End-to-end smoke test for the Memory container (profile-agnostic).
 
     docker run --rm --network "$(basename $PWD)_memory" --entrypoint python \
       -v "$PWD/tests/smoke_test.py:/smoke.py:ro" memory:latest /smoke.py
@@ -15,7 +15,7 @@ TOKEN = "smoke-" + "0123456789abcdef"
 
 async def main():
     async with streamable_http_client(URL) as (r, w):
-        async with ClientSession(r, w) as s:
+        async with ClientSession(r, w, read_timeout_seconds=60) as s:
             await s.initialize()
             tools = [t.name for t in (await s.list_tools()).tools]
             assert len(tools) >= 30, f"too few tools: {len(tools)}"

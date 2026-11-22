@@ -166,6 +166,34 @@ flowchart LR
 
 ---
 
+## 📚 RAG — knowledge base (documents)
+
+Memory holds facts about the user/agent; **RAG holds your documents** — a separate lane on the same stack (its own Qdrant collection `kb_chunks` + a `kb_documents` ledger). Documents are **not** stored as memories, so decay/dedup/supersession never touch your files.
+
+| Tool | Purpose |
+|---|---|
+| `memory_kb_ingest` | chunk + embed + store a document (idempotent per source) |
+| `memory_kb_search` | retrieve top chunks with **citations** (`source#chunk`) |
+| `memory_kb_sources` | list ingested documents |
+| `memory_kb_delete` | delete a document by `doc_id` or `source` |
+| `memory_kb_reconcile` | mark contradicting doc chunks **stale** + append an update chunk (memory → knowledge) |
+
+```bash
+memory_kb_ingest { "text": "...", "source": "runbook.md", "title": "Runbook" }
+memory_kb_search { "query": "backup window", "top_k": 5 }
+```
+
+**Memory → knowledge reconciliation:** when a *confirmed* memory (importance ≥ `MEMORY_KB_SYNC_MIN_IMPORTANCE`) contradicts a document, `memory_kb_reconcile` (and, with `MEMORY_KB_AUTOSYNC=1`, the store path automatically) **marks the affected chunk `stale` (reversible — never deleted)** and appends an `update` chunk. `memory_kb_search` hides stale chunks by default (`include_stale` reveals them).
+
+**Full interconnection:**
+- **Docs route to RAG, not memory** — `memory_store` with `category:"documentation"` (or any long, structured document ≥ `MEMORY_DOC_ROUTE_CHARS`) is stored in the knowledge base and returns `routed_to:"rag"` (no `memory_id`).
+- **Recall searches both lanes** — with `MEMORY_RECALL_INCLUDE_KB=1`, `memory_recall` returns a `knowledge` array (with citations) alongside `memories`, in one call.
+- **Memory updates RAG** — `memory_kb_reconcile` / `MEMORY_KB_AUTOSYNC`.
+
+Reuses the same embeddings, cross-encoder reranker, scope auth and durability — one stack, two lanes: **memory = what's true about you, RAG = what's true in your files.**
+
+---
+
 ## 🚀 Install
 
 ### Prerequisites
@@ -250,11 +278,15 @@ npx -y mcp-remote http://127.0.0.1:4000/mcp
 | `MEMORY_PG_USER` / `_PASSWORD` / `_DB` | `memory` / — / `memory` | Postgres |
 | `MEMORY_REDIS_PASSWORD` | — | Redis AUTH (required) |
 | `MEMORY_HTTP_PORT_HOST` | `4000` | Host loopback port |
-| `MEMORY_TOOL_PROFILE` | `agent` | `agent` (~40 tools) or `full` (~74) |
+| `MEMORY_TOOL_PROFILE` | `agent` | `agent` (~45 tools) or `full` (~79) |
 | `VIRTUAL_CONTEXT_ENABLED` | `1` | Inject context blocks into recall/session responses |
 | `MEMORY_MAINTENANCE` | `1` | Nightly consolidate / dream / decay / promote / backup |
 | `MEMORY_EAGER_PREWARM` | `1` | Warm models + BM25 at boot |
 | `MEMORY_JUDGE_ENDPOINT` / `_MODEL` / `_API_KEY` | blank | Optional OpenAI‑compatible LLM judge |
+| `MEMORY_KB_AUTOSYNC` | `0` | Auto-reconcile memory→RAG on confirmed stores |
+| `MEMORY_KB_SYNC_MIN_IMPORTANCE` | `7` | Min importance for a memory to update the knowledge base |
+| `MEMORY_RECALL_INCLUDE_KB` | `0` | Recall also searches the knowledge base (returns a `knowledge` array) |
+| `MEMORY_DOC_ROUTE_CHARS` | `2000` | Long structured content auto-routes to RAG |
 
 ---
 
